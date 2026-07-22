@@ -1,0 +1,21 @@
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Python cache/bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables / secrets
+.env
+
+# OS/editor noise
+.DS_Store
+.vscode/
+.idea/
+
+# Logs (Phase 5 will generate these)
+*.log
+logs/
