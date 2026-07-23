@@ -1,0 +1,4 @@
+Welcome to DesiCDN.
+This file lives on the Origin server.
+In later phases, Edge (PoP) servers will cache a copy of this
+so it can be served closer to you without hitting origin every time.

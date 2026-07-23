@@ -1,0 +1,4 @@
+{
+  "message": "Hello from the Origin Server!",
+  "note": "If you're seeing this, you fetched directly from origin - no caching involved yet."
+}
