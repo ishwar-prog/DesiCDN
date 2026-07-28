@@ -30,6 +30,7 @@ import time
 import requests
 from fastapi import FastAPI, HTTPException, Response
 from shared.pop_config import POPS
+from shared.logging_utils import log_request, read_logs
 
 POP_ID = os.environ.get("POP_ID", "delhi")
 
@@ -81,26 +82,20 @@ def get_content(filename: str):
     """
     Serve a file - from cache if we have a fresh copy, otherwise fetch
     from origin, cache it, then serve it.
+
+    Every outcome (hit, miss, 404, origin-down) is timed and logged as
+    a structured record - this is what /metrics later reads and
+    summarizes into a hit rate.
     """
-    now = time.time()
+    start_time = time.time()  # start the stopwatch for THIS request
 
     # ---- Check for a CACHE HIT ----
     if filename in cache:
         entry = cache[filename]
-        age = now - entry["cached_at"]
+        age = start_time - entry["cached_at"]
 
         if age < CACHE_TTL_SECONDS:
             # Fresh! Serve directly from memory - no origin involved.
-            #
-            # IMPORTANT BUG LESSON: headers must be set on the SAME
-            # Response object we actually return. Earlier version of
-            # this code set headers on the `response` object FastAPI
-            # injects, but then returned a DIFFERENT, newly-created
-            # Response object - which silently discarded those headers.
-            # FastAPI only sends whichever Response object your function
-            # actually returns; injected parameter objects are only
-            # respected if you mutate THEM and return THEM (or don't
-            # return a Response at all, and just return plain data).
             hit_response = Response(
                 content=entry["content"],
                 media_type=entry["media_type"],
@@ -108,26 +103,30 @@ def get_content(filename: str):
             hit_response.headers["X-Cache"] = "HIT"
             hit_response.headers["X-Cache-Age-Seconds"] = str(round(age, 1))
             hit_response.headers["X-Served-By"] = POP_INFO["name"]
+
+            elapsed_ms = (time.time() - start_time) * 1000
+            log_request(POP_ID, filename, "HIT", elapsed_ms)
+
             return hit_response
         # else: entry exists but is STALE (past TTL) - fall through to
-        # miss handling below, exactly as if we never had it. This is
-        # the TTL expiry behavior in action.
+        # miss handling below, exactly as if we never had it.
 
     # ---- CACHE MISS: fetch from origin ----
     try:
         origin_response = requests.get(f"{ORIGIN_URL}/content/{filename}", timeout=5)
     except requests.exceptions.ConnectionError:
-        # Origin is unreachable entirely - a DIFFERENT failure mode
-        # than "origin said 404." Worth telling apart: this means the
-        # whole CDN is in trouble, not just that one file is missing.
+        elapsed_ms = (time.time() - start_time) * 1000
+        log_request(POP_ID, filename, "ORIGIN_DOWN", elapsed_ms)
         raise HTTPException(status_code=502, detail="Could not reach origin server")
 
     if origin_response.status_code == 404:
-        # Origin explicitly doesn't have this file - don't cache a
-        # "not found," just pass the 404 through honestly.
+        elapsed_ms = (time.time() - start_time) * 1000
+        log_request(POP_ID, filename, "NOT_FOUND", elapsed_ms)
         raise HTTPException(status_code=404, detail=f"'{filename}' not found on origin")
 
     if origin_response.status_code != 200:
+        elapsed_ms = (time.time() - start_time) * 1000
+        log_request(POP_ID, filename, "ORIGIN_ERROR", elapsed_ms)
         raise HTTPException(
             status_code=502,
             detail=f"Origin returned unexpected status {origin_response.status_code}",
@@ -138,10 +137,72 @@ def get_content(filename: str):
     cache[filename] = {
         "content": origin_response.content,
         "media_type": media_type,
-        "cached_at": now,
+        "cached_at": start_time,
     }
 
     miss_response = Response(content=origin_response.content, media_type=media_type)
     miss_response.headers["X-Cache"] = "MISS"
     miss_response.headers["X-Served-By"] = POP_INFO["name"]
+
+    elapsed_ms = (time.time() - start_time) * 1000
+    log_request(POP_ID, filename, "MISS", elapsed_ms)
+
     return miss_response
+
+
+@app.get("/metrics")
+def metrics():
+    """
+    Read back this PoP's own log history and summarize it into
+    meaningful numbers - this is the "aggregation" step: turning many
+    individual log records into a hit rate.
+
+    This is a tiny hand-built version of what real observability tools
+    (Prometheus is the industry-standard one) do at massive scale:
+    collect structured events, then expose summarized numbers.
+    """
+    records = read_logs(POP_ID)
+
+    if not records:
+        return {
+            "pop_id": POP_ID,
+            "total_requests": 0,
+            "message": "No requests logged yet - try requesting /content/hello.json first.",
+        }
+
+    total = len(records)
+    hits = sum(1 for r in records if r["cache_status"] == "HIT")
+    misses = sum(1 for r in records if r["cache_status"] == "MISS")
+    not_found = sum(1 for r in records if r["cache_status"] == "NOT_FOUND")
+    origin_down = sum(1 for r in records if r["cache_status"] == "ORIGIN_DOWN")
+
+    # Average response time, split by hit vs miss - this is the number
+    # that actually PROVES caching helps, using YOUR OWN measured data
+    # rather than just claiming "caching is faster."
+    hit_times = [r["response_time_ms"] for r in records if r["cache_status"] == "HIT"]
+    miss_times = [r["response_time_ms"] for r in records if r["cache_status"] == "MISS"]
+
+    avg_hit_ms = round(sum(hit_times) / len(hit_times), 2) if hit_times else None
+    avg_miss_ms = round(sum(miss_times) / len(miss_times), 2) if miss_times else None
+
+    # Count requests per filename - shows which content is most popular,
+    # a real thing CDN operators look at (e.g. to decide what to
+    # pre-warm/pre-cache before it's even requested).
+    requests_per_file = {}
+    for r in records:
+        requests_per_file[r["filename"]] = requests_per_file.get(r["filename"], 0) + 1
+
+    return {
+        "pop_id": POP_ID,
+        "total_requests": total,
+        "hits": hits,
+        "misses": misses,
+        "not_found": not_found,
+        "origin_down": origin_down,
+        "hit_rate_percent": round((hits / total) * 100, 1) if total else 0,
+        "avg_response_time_ms": {
+            "hit": avg_hit_ms,
+            "miss": avg_miss_ms,
+        },
+        "requests_per_file": requests_per_file,
+    }
