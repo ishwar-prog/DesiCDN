@@ -31,6 +31,7 @@ import requests
 from fastapi import FastAPI, HTTPException, Response
 from shared.pop_config import POPS
 from shared.logging_utils import log_request, read_logs
+from shared.lru_cache import LRUCache
 
 POP_ID = os.environ.get("POP_ID", "delhi")
 
@@ -53,14 +54,20 @@ ORIGIN_URL = os.environ.get("ORIGIN_URL", "http://127.0.0.1:9000")
 # while a news homepage might get seconds.
 CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "60"))
 
+# Maximum number of DISTINCT files this PoP will hold in cache at once.
+# Deliberately small (3) by default so you can actually TRIGGER and
+# OBSERVE eviction in a normal testing session without needing
+# thousands of unique files. Real edge caches size this based on
+# available RAM/disk - could be millions of objects in production.
+MAX_CACHE_SIZE = int(os.environ.get("MAX_CACHE_SIZE", "3"))
+
 app = FastAPI(title=f"DesiCDN - Edge Server ({POP_INFO['name']})")
 
-# THE CACHE ITSELF.
-# Structure: { filename: {"content": bytes, "media_type": str, "cached_at": float} }
-# This is plain Python, living only in this process's memory - restart
-# the server, the cache is gone. That's expected and realistic (see
-# explanation given alongside this code).
-cache = {}
+# THE CACHE ITSELF - now an LRUCache instead of a plain dict, so it has
+# a maximum size and a real eviction policy once full. See
+# shared/lru_cache.py for the full explanation of how/why this works.
+# Structure per entry: {"content": bytes, "media_type": str, "cached_at": float}
+cache = LRUCache(max_size=MAX_CACHE_SIZE)
 
 
 @app.get("/")
@@ -72,7 +79,9 @@ def health_check():
         "pop_name": POP_INFO["name"],
         "lat": POP_INFO["lat"],
         "lon": POP_INFO["lon"],
-        "cached_files": list(cache.keys()),
+        "cached_files": cache.keys(),
+        "cache_size": len(cache),
+        "max_cache_size": MAX_CACHE_SIZE,
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
     }
 
@@ -90,8 +99,8 @@ def get_content(filename: str):
     start_time = time.time()  # start the stopwatch for THIS request
 
     # ---- Check for a CACHE HIT ----
-    if filename in cache:
-        entry = cache[filename]
+    entry = cache.get(filename)
+    if entry is not None:
         age = start_time - entry["cached_at"]
 
         if age < CACHE_TTL_SECONDS:
@@ -132,13 +141,19 @@ def get_content(filename: str):
             detail=f"Origin returned unexpected status {origin_response.status_code}",
         )
 
-    # Store in cache for next time.
+    # Store in cache for next time. If the cache is already at
+    # MAX_CACHE_SIZE and this is a new filename, put() will evict the
+    # least-recently-used entry to make room - we log that eviction so
+    # it's visible in the structured logs, not a silent side effect.
     media_type = origin_response.headers.get("content-type", "application/octet-stream")
-    cache[filename] = {
+    evicted_filename = cache.put(filename, {
         "content": origin_response.content,
         "media_type": media_type,
         "cached_at": start_time,
-    }
+    })
+
+    if evicted_filename is not None:
+        log_request(POP_ID, evicted_filename, "EVICTED", 0.0)
 
     miss_response = Response(content=origin_response.content, media_type=media_type)
     miss_response.headers["X-Cache"] = "MISS"

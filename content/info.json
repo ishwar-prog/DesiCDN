@@ -1,0 +1,4 @@
+{
+  "message": "This is a third file, added specifically to test LRU eviction.",
+  "note": "If MAX_CACHE_SIZE is 2 and you request 3 distinct files, one should get evicted."
+}
