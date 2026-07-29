@@ -82,6 +82,26 @@ class LRUCache:
         self._store[key] = value
         return evicted_key
 
+    def delete(self, key) -> bool:
+        """
+        Explicitly remove `key` from the cache, regardless of TTL or
+        recency - used for INVALIDATION (a human/system saying "forget
+        this specific item right now"), as opposed to TTL expiry or
+        LRU eviction, which happen automatically over time.
+
+        Returns True if something was actually removed, False if the
+        key wasn't cached in the first place. This makes the operation
+        IDEMPOTENT from the caller's perspective: calling delete() on
+        an already-absent key is a safe no-op, not an error - calling
+        it once or five times in a row has the same end result (the
+        key is gone), which matters if a network retry causes the same
+        delete request to arrive more than once.
+        """
+        if key in self._store:
+            del self._store[key]
+            return True
+        return False
+
     def __contains__(self, key):
         return key in self._store
 

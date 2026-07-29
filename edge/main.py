@@ -221,3 +221,39 @@ def metrics():
         },
         "requests_per_file": requests_per_file,
     }
+
+@app.delete("/cache/{filename}")
+def invalidate(filename: str):
+    """
+    Explicitly remove ONE specific file from THIS PoP's cache, right
+    now - regardless of its TTL or LRU recency. This is the "purge"
+    operation real CDNs expose so content can be force-refreshed
+    without waiting for natural TTL expiry (e.g. after fixing a bug
+    in a file, or updating a price, you don't want to wait minutes
+    for stale content to age out on its own).
+
+    Uses HTTP DELETE - the correct REST convention for "remove a
+    resource" (GET = read, POST = create, DELETE = remove) - signaling
+    intent clearly through the HTTP verb itself, not just the URL.
+
+    IDEMPOTENT: calling this on a file that isn't cached is NOT an
+    error - it just reports that nothing needed to be done. Calling
+    this twice in a row has the same end state as calling it once
+    (the file is simply not cached either way). This matters in
+    distributed systems where a network retry could cause the same
+    delete request to be sent more than once - it should be harmless.
+    """
+    was_present = cache.delete(filename)
+
+    log_request(POP_ID, filename, "INVALIDATED" if was_present else "INVALIDATE_NOOP", 0.0)
+
+    return {
+        "pop_id": POP_ID,
+        "filename": filename,
+        "was_cached": was_present,
+        "message": (
+            f"'{filename}' has been removed from cache."
+            if was_present
+            else f"'{filename}' was not cached - nothing to remove."
+        ),
+    }
